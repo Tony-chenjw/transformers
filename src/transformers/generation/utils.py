@@ -2625,7 +2625,7 @@ class GenerationMixin:
         cross_attentions = () if (return_dict_in_generate and output_attentions) else None
         decoder_hidden_states = () if (return_dict_in_generate and output_hidden_states) else None
 
-        # if model is an encoder-decoder, retrieve encoder attention weights and hidden states
+        # if model is an encoder-decoder, retrieve encoder attention weights and hidden states # !!!
         if return_dict_in_generate and self.config.is_encoder_decoder:
             encoder_attentions = model_kwargs["encoder_outputs"].get("attentions") if output_attentions else None
             encoder_hidden_states = (
@@ -2640,8 +2640,8 @@ class GenerationMixin:
 
         while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
             # prepare model inputs
+            breakpoint()
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
-
             # forward pass to get next token
             outputs = self(
                 **model_inputs,
@@ -2655,10 +2655,10 @@ class GenerationMixin:
 
             # Clone is needed to avoid keeping a hanging ref to outputs.logits which may be very large for first iteration
             # (the clone itself is always small)
-            next_token_logits = outputs.logits[:, -1, :].clone()
+            next_token_logits = outputs.logits[:, -1, :].clone()  # the last pos of cur sequence !!! [batch_size, vocab_size]
 
             # pre-process distribution
-            next_token_scores = logits_processor(input_ids, next_token_logits)
+            next_token_scores = logits_processor(input_ids, next_token_logits)  # [batch_size, vocab_size]
             if do_sample:
                 next_token_scores = logits_warper(input_ids, next_token_scores)
 
@@ -2684,8 +2684,8 @@ class GenerationMixin:
 
             # token selection
             if do_sample:
-                probs = nn.functional.softmax(next_token_scores, dim=-1)
-                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+                probs = nn.functional.softmax(next_token_scores, dim=-1)  # [batch_size, vocab_size]
+                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)  # [batch_size]
             else:
                 next_tokens = torch.argmax(next_token_scores, dim=-1)
 
@@ -2694,7 +2694,7 @@ class GenerationMixin:
                 next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
 
             # update generated ids, model inputs, and length for next step
-            input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+            input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)  # append next token
             if streamer is not None:
                 streamer.put(next_tokens.cpu())
             model_kwargs = self._update_model_kwargs_for_generation(

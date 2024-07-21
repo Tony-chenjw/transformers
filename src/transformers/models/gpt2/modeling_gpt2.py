@@ -65,6 +65,29 @@ _CHECKPOINT_FOR_DOC = "openai-community/gpt2"
 _CONFIG_FOR_DOC = "GPT2Config"
 
 
+# Efficient implementation equivalent to the following:
+def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None) -> torch.Tensor:
+    L, S = query.size(-2), key.size(-2)  # L: inpuit_seq_len[prompt_len for prompt, 1 for predicting], S: cur_seq_len[prompt_len + predicting_len]
+    scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale
+    attn_bias = torch.zeros(L, S, dtype=query.dtype)
+    if is_causal:
+        assert attn_mask is None
+        temp_mask = torch.ones(L, S, dtype=torch.bool).tril(diagonal=0)
+        attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
+        attn_bias.to(query.dtype)
+
+    if attn_mask is not None:
+        if attn_mask.dtype == torch.bool:
+            attn_bias.masked_fill_(attn_mask.logical_not(), float("-inf"))
+        else:
+            attn_bias += attn_mask
+    
+    attn_weight = query @ key.transpose(-2, -1) * scale_factor  # [batch_size, num_heads, L, S]
+    attn_weight += attn_bias
+    attn_weight = torch.softmax(attn_weight, dim=-1)
+    attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
+    return attn_weight @ value
+
 # Copied from transformers.models.llama.modeling_llama._get_unpad_data
 def _get_unpad_data(attention_mask):
     seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
@@ -324,6 +347,7 @@ class GPT2Attention(nn.Module):
             key, value = self.c_attn(encoder_hidden_states).split(self.split_size, dim=2)
             attention_mask = encoder_attention_mask
         else:
+            breakpoint()
             query, key, value = self.c_attn(hidden_states).split(self.split_size, dim=2)
 
         query = self._split_heads(query, self.num_heads, self.head_dim)
@@ -605,7 +629,7 @@ class GPT2SdpaAttention(GPT2Attention):
                 output_attentions=output_attentions,
             )
 
-        bsz, q_len, _ = hidden_states.size()
+        bsz, q_len, _ = hidden_states.size()  # [batch_size, input_seq_len, hidden_size]
 
         # Initial attention projections
         is_cross_attention = encoder_hidden_states is not None
@@ -622,11 +646,11 @@ class GPT2SdpaAttention(GPT2Attention):
         else:
             query, key, value = self.c_attn(hidden_states).split(self.split_size, dim=2)
 
-        query = self._split_heads(query, self.num_heads, self.head_dim)
-        key = self._split_heads(key, self.num_heads, self.head_dim)
-        value = self._split_heads(value, self.num_heads, self.head_dim)
+        query = self._split_heads(query, self.num_heads, self.head_dim)  # [batch_size, num_heads, input_seq_len, head_dim], input_seq_len if kv_cacke == True
+        key = self._split_heads(key, self.num_heads, self.head_dim)  # [batch_size, num_heads, input_seq_len, head_dim], input_seq_len if kv_cacke == True
+        value = self._split_heads(value, self.num_heads, self.head_dim)  # [batch_size, num_heads, input_seq_len, head_dim], input_seq_len if kv_cacke == True
 
-        # Optional kv caching
+        # Optional kv caching !!!
         if layer_past is not None:
             past_key = layer_past[0]
             past_value = layer_past[1]
@@ -634,7 +658,7 @@ class GPT2SdpaAttention(GPT2Attention):
             value = torch.cat((past_value, value), dim=-2)
 
         present = None
-        if use_cache is True:
+        if use_cache is True:  # init kv cache
             present = (key, value)
 
         # Avoid torch==2.1.2 specific bug for the memory-efficient backend in SDPA
@@ -645,12 +669,24 @@ class GPT2SdpaAttention(GPT2Attention):
 
         # We dispatch to SDPA's Flash Attention or Efficient kernels via this `is_causal` if statement instead of an inline conditional assignment
         # in SDPA to support both torch.compile's dynamic shapes and full graph options. An inline conditional prevents dynamic shapes from compiling.
-        is_causal = True if attention_mask is None and q_len > 1 and not is_cross_attention else False
+        is_causal = True if attention_mask is None and q_len > 1 and not is_cross_attention else False  # True for prompt, False for predicting
 
-        attn_output = torch.nn.functional.scaled_dot_product_attention(
-            query,
-            key,
-            value,
+        # # atten_output: [batch_size, num_heads, seq_len, head_dim]
+        # attn_output = torch.nn.functional.scaled_dot_product_attention(
+        #     query,  # [batch_size, num_heads, input_seq_len, head_dim]
+        #     key,  # [batch_size, num_heads, cur_seq_len, head_dim]
+        #     value,  # [batch_size, num_heads, cur_seq_len, head_dim]
+        #     attn_mask=attention_mask,
+        #     dropout_p=self.attn_dropout.p if self.training else 0.0,
+        #     is_causal=is_causal,
+        # )
+
+        breakpoint()
+        # atten_output: [batch_size, num_heads, seq_len, head_dim]
+        attn_output = scaled_dot_product_attention(
+            query,  # [batch_size, num_heads, input_seq_len, head_dim]
+            key,  # [batch_size, num_heads, cur_seq_len, head_dim]
+            value,  # [batch_size, num_heads, cur_seq_len, head_dim]
             attn_mask=attention_mask,
             dropout_p=self.attn_dropout.p if self.training else 0.0,
             is_causal=is_causal,
@@ -658,13 +694,13 @@ class GPT2SdpaAttention(GPT2Attention):
 
         # Reshape outputs
         attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.view(bsz, q_len, self.embed_dim)
+        attn_output = attn_output.view(bsz, q_len, self.embed_dim)  # [batch_size, input_seq_len, hidden_size]
 
         # Final projection
-        attn_output = self.c_proj(attn_output)
-        attn_output = self.resid_dropout(attn_output)
+        attn_output = self.c_proj(attn_output)  # [batch_size, input_seq_len, hidden_size]
+        attn_output = self.resid_dropout(attn_output)  # [batch_size, input_seq_len, hidden_size]
 
-        return attn_output, present, None
+        return attn_output, present, None  # attn_output, (k, v), None
 
 
 class GPT2MLP(nn.Module):
@@ -725,8 +761,9 @@ class GPT2Block(nn.Module):
             use_cache=use_cache,
             output_attentions=output_attentions,
         )
-        attn_output = attn_outputs[0]  # output_attn: a, present, (attentions)
-        outputs = attn_outputs[1:]
+        # output_attn: a, present, (attentions)
+        attn_output = attn_outputs[0]  # [batch_size, input_seq_len, hidden_size]
+        outputs = attn_outputs[1:] # ((k, v), None)
         # residual connection
         hidden_states = attn_output + residual
 
@@ -763,7 +800,7 @@ class GPT2Block(nn.Module):
         else:
             outputs = (hidden_states,) + outputs[1:]
 
-        return outputs  # hidden_states, present, (attentions, cross_attentions)
+        return outputs  # (hidden_states, (k, v), None)
 
 
 class GPT2PreTrainedModel(PreTrainedModel):
@@ -1000,8 +1037,8 @@ class GPT2Model(GPT2PreTrainedModel):
 
         self.embed_dim = config.hidden_size
 
-        self.wte = nn.Embedding(config.vocab_size, self.embed_dim)
-        self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
+        self.wte = nn.Embedding(config.vocab_size, self.embed_dim)  # Word Token Embeddings
+        self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)  # Word Position Embeddings
 
         self.drop = nn.Dropout(config.embd_pdrop)
         self.h = nn.ModuleList([GPT2Block(config, layer_idx=i) for i in range(config.num_hidden_layers)])
@@ -1120,21 +1157,23 @@ class GPT2Model(GPT2PreTrainedModel):
         if token_type_ids is not None:
             token_type_ids = token_type_ids.view(-1, input_shape[-1])
 
-        if past_key_values is None:
+        if past_key_values is None:  # predicting from prompt
             past_length = 0
             past_key_values = tuple([None] * len(self.h))
-        else:
+        else:  # predicting auto-regressively
             past_length = past_key_values[0][0].size(-2)
+        
         if position_ids is None:
             position_ids = torch.arange(past_length, input_shape[-1] + past_length, dtype=torch.long, device=device)
             position_ids = position_ids.unsqueeze(0)
 
         if inputs_embeds is None:
-            inputs_embeds = self.wte(input_ids)
-        position_embeds = self.wpe(position_ids)
-        hidden_states = inputs_embeds + position_embeds
+            inputs_embeds = self.wte(input_ids)  # [batch_size, input_seq_length, hidden_size], input_seq_length = 1 if predicting auto-regressively else prompt_len
+        position_embeds = self.wpe(position_ids)  # [batch_size, input_seq_length, hidden_size], input_seq_length = 1 if predicting auto-regressively else prompt_len
+        hidden_states = inputs_embeds + position_embeds  # x = word_embed(x) + pos_embed, input_seq_length = 1 if predicting auto-regressively else prompt_len
 
         # Attention mask.
+        # sdpa: Scaled Dot Product Attention
         _use_sdpa = self._attn_implementation == "sdpa" and output_attentions is False and head_mask is None
         if attention_mask is not None:
             attention_mask = attention_mask.view(batch_size, -1)
@@ -1189,9 +1228,9 @@ class GPT2Model(GPT2PreTrainedModel):
             token_type_embeds = self.wte(token_type_ids)
             hidden_states = hidden_states + token_type_embeds
 
-        hidden_states = self.drop(hidden_states)
+        hidden_states = self.drop(hidden_states)  # [batch_size, input_seq_len, hidden_size]
 
-        output_shape = (-1,) + input_shape[1:] + (hidden_states.size(-1),)
+        output_shape = (-1,) + input_shape[1:] + (hidden_states.size(-1),)  # [-1, input_seq_len, hidden_size]
 
         if self.gradient_checkpointing and self.training:
             if use_cache:
@@ -1232,20 +1271,21 @@ class GPT2Model(GPT2PreTrainedModel):
                     output_attentions,
                 )
             else:
+                breakpoint()
                 outputs = block(
-                    hidden_states,
-                    layer_past=layer_past,
+                    hidden_states,  # if kv_cache == True: [batch_size, input_seq_len, hidden_size], input_seq_length = 1 if predicting auto-regressively else prompt_len
+                    layer_past=layer_past,  # if kv_cache == True: layer_past = Tuple(k, v), k: [batch_size, num_heads, past_seq_len, head_dim]
                     attention_mask=attention_mask,
                     head_mask=head_mask[i],
                     encoder_hidden_states=encoder_hidden_states,
                     encoder_attention_mask=encoder_attention_mask,
                     use_cache=use_cache,
                     output_attentions=output_attentions,
-                )
+                )  # (hidden_states, (k, v), None)
 
-            hidden_states = outputs[0]
+            hidden_states = outputs[0]  # [batch_size, input_seq_len, hidden_size]
             if use_cache is True:
-                presents = presents + (outputs[1],)
+                presents = presents + (outputs[1],)  # ((k, v), ..., (k, v)) with len == config.n_layer
 
             if output_attentions:
                 all_self_attentions = all_self_attentions + (outputs[2 if use_cache else 1],)
@@ -1257,10 +1297,10 @@ class GPT2Model(GPT2PreTrainedModel):
                 for k, v in self.device_map.items():
                     if i == v[-1] and "cuda:" + str(k) != self.last_device:
                         hidden_states = hidden_states.to("cuda:" + str(k + 1))
+        breakpoint()
+        hidden_states = self.ln_f(hidden_states)  # [batch_size, input_seq_len, hidden_size]
 
-        hidden_states = self.ln_f(hidden_states)
-
-        hidden_states = hidden_states.view(output_shape)
+        hidden_states = hidden_states.view(output_shape)  # [-1, input_seq_len, hidden_size]
         # Add last hidden state
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
@@ -1343,17 +1383,17 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None, inputs_embeds=None, **kwargs):
         token_type_ids = kwargs.get("token_type_ids", None)
         # Omit tokens covered by past_key_values
-        if past_key_values:
-            past_length = past_key_values[0][0].shape[2]
+        if past_key_values:  # True if kv_cache == True and predicting auto-regressively else False
+            past_length = past_key_values[0][0].shape[2]  # past_key_values[0][0]: [batch_size, num_heads, past_seq_len, head_dim]
 
             # Some generation methods already pass only the last input ID
-            if input_ids.shape[1] > past_length:
+            if input_ids.shape[1] > past_length:  # input_ids.shape: [batch_size, cur_seq_len], past_length: past_seq_len
                 remove_prefix_length = past_length
             else:
                 # Default to old behavior: keep only final ID
                 remove_prefix_length = input_ids.shape[1] - 1
 
-            input_ids = input_ids[:, remove_prefix_length:]
+            input_ids = input_ids[:, remove_prefix_length:]  # the latest token_id: [batch_size, cur_seq_len - past_seq_len == 1]
             if token_type_ids is not None:
                 token_type_ids = token_type_ids[:, -input_ids.shape[1] :]
 
@@ -1365,7 +1405,7 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 1)
             if past_key_values:
-                position_ids = position_ids[:, -input_ids.shape[1] :]
+                position_ids = position_ids[:, -input_ids.shape[1] :]  # the latest token_id: [batch_size, cur_seq_len - past_seq_len == 1]
         else:
             position_ids = None
 
@@ -1417,10 +1457,10 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
             are ignored (masked), the loss is only computed for labels in `[0, ..., config.vocab_size]`
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
+        breakpoint()
         transformer_outputs = self.transformer(
-            input_ids,
-            past_key_values=past_key_values,
+            input_ids,  # if kv_cache == True: input_ids = [batch_size, cur_seq_len - past_seq_len == 1] for the following predicting, [batch_size, prompt_seq_len] for the prompt predicting
+            past_key_values=past_key_values,  # if kv_cache == True: past_key_values = ((k, v), ..., (k, v)) with len == config.n_layer, k: [batch_size, num_heads, past_seq_len, head_dim]
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
             position_ids=position_ids,
@@ -1432,15 +1472,15 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
-        )
-        hidden_states = transformer_outputs[0]
+        )  # BaseModelOutputWithPastAndCrossAttentions(last_hidden_state=hidden_states, past_key_values=presents,)
+        hidden_states = transformer_outputs[0]  # [batch_size, input_seq_len, hidden_size]
 
         # Set device for model parallelism
         if self.model_parallel:
             torch.cuda.set_device(self.transformer.first_device)
             hidden_states = hidden_states.to(self.lm_head.weight.device)
 
-        lm_logits = self.lm_head(hidden_states)
+        lm_logits = self.lm_head(hidden_states)  # [batch_size, input_seq_len, vocab_size]
 
         loss = None
         if labels is not None:

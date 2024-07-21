@@ -1,0 +1,1 @@
+python run_generation.py --model_type=gpt2 --model_name_or_path=openai-community/gpt2 --use_cpu --prompt "how are you today?"

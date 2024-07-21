@@ -16,6 +16,10 @@
 # limitations under the License.
 """Conditional text generation with the auto-regressive models of the library (GPT/GPT-2/CTRL/Transformer-XL/XLNet)"""
 
+import os
+# os.environ['HTTP_PROXY'] = 'http://127.0.0.1:7890'
+# os.environ['HTTPS_PROXY'] = 'http://127.0.0.1:7890'
+
 import argparse
 import inspect
 import logging
@@ -340,7 +344,6 @@ def main():
 
     if args.seed is not None:
         set_seed(args.seed)
-
     # Initialize the model and tokenizer
     try:
         args.model_type = args.model_type.lower()
@@ -348,6 +351,8 @@ def main():
     except KeyError:
         raise KeyError("the model {} you specified is not supported. You are welcome to add it and open a PR :)")
 
+    # access_token = "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"
+    # tokenizer = tokenizer_class.from_pretrained(args.model_name_or_path, token=access_token)
     tokenizer = tokenizer_class.from_pretrained(args.model_name_or_path)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -405,6 +410,7 @@ def main():
 
         model = _ModelFallbackWrapper(traced_model, model)
 
+    breakpoint()
     output_sequences = model.generate(
         input_ids=input_ids,
         max_length=args.length + len(encoded_prompt[0]),
